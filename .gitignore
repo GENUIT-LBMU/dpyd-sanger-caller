@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+.pytest_cache/
+*.egg-info/
+tests/fixtures/*.fsa
+tests/fixtures/*.ab1
+!tests/fixtures/.gitkeep
+*:Zone.Identifier
+
+# secrets + patient data — NEVER commit
+.streamlit/secrets.toml
+data/dpyd_sanger.db
+data/dpyd_sanger.db-journal
+data/dpyd_sanger.db-wal
+data/dpyd_sanger.db-shm
+data/patient_files/
+
+# reference .fsa files (optional — uncomment if you don't want to commit them)
+# data/references/*.fsa
+# data/references/*.ab1
