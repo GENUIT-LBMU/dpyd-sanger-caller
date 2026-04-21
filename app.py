@@ -13,6 +13,7 @@ from db import (
     dashboard_stats,
     init_db,
     recent_patients,
+    truncate_all_data,
     variant_frequencies,
 )
 
@@ -135,6 +136,40 @@ def main():
     render_variant_frequencies(variants)
     st.divider()
     render_recent_patients()
+    st.divider()
+    render_admin_panel(stats)
+
+
+def render_admin_panel(stats: dict):
+    with st.expander("⚙️ Administración"):
+        st.caption(
+            "Acciones críticas. El reset borra **todos los pacientes, análisis, reportes CPIC "
+            "y archivos `.fsa`** subidos. Las referencias y los amplicones **no** se tocan."
+        )
+        st.markdown(f"**Estado actual**: {stats['total_patients']} paciente(s) — "
+                    f"{stats['pending']} pendientes, {stats['reported']} reportados")
+        confirm1 = st.checkbox(
+            "Confirmo que quiero eliminar TODOS los datos de pacientes",
+            key="admin_reset_confirm_1",
+        )
+        confirm2 = False
+        if confirm1:
+            confirm2 = st.checkbox(
+                "Entiendo que esta acción es **irreversible**",
+                key="admin_reset_confirm_2",
+            )
+        if confirm1 and confirm2:
+            if st.button("🗑️ Eliminar todos los datos ahora", type="secondary"):
+                counts = truncate_all_data()
+                st.session_state.pop("admin_reset_confirm_1", None)
+                st.session_state.pop("admin_reset_confirm_2", None)
+                st.success(
+                    f"✅ Base reseteada. Eliminados: {counts['patients']} pacientes, "
+                    f"{counts['variant_calls']} llamados de variante, "
+                    f"{counts['cpic_reports']} reportes CPIC, "
+                    f"{counts['patient_files']} archivos `.fsa`."
+                )
+                st.rerun()
 
 
 if __name__ == "__main__":

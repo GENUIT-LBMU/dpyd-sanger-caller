@@ -90,6 +90,34 @@ def delete_patient(patient_id: str) -> None:
         pass
 
 
+def truncate_all_data() -> dict:
+    """Delete ALL patients (cascading to calls + reports) and all patient .fsa files.
+
+    Returns counts of what was deleted for confirmation.
+    """
+    init_db()
+    with get_connection() as conn:
+        n_patients = conn.execute("SELECT COUNT(*) AS n FROM patients").fetchone()["n"]
+        n_calls = conn.execute("SELECT COUNT(*) AS n FROM variant_calls").fetchone()["n"]
+        n_reports = conn.execute("SELECT COUNT(*) AS n FROM cpic_reports").fetchone()["n"]
+        conn.execute("DELETE FROM patients")  # cascades to variant_calls + cpic_reports
+        conn.commit()
+
+    n_files = 0
+    try:
+        from dpyd_caller.patient_files import PATIENT_FILES_ROOT
+        import shutil
+        if PATIENT_FILES_ROOT.exists():
+            for child in PATIENT_FILES_ROOT.iterdir():
+                if child.is_dir():
+                    n_files += len(list(child.glob("*")))
+                    shutil.rmtree(child)
+    except Exception:
+        pass
+
+    return {"patients": n_patients, "variant_calls": n_calls, "cpic_reports": n_reports, "patient_files": n_files}
+
+
 def save_variant_call(patient_id: str, variant_id: str, analysis) -> None:
     """Save a VariantAnalysis object to the DB."""
     init_db()

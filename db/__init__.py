@@ -13,6 +13,7 @@ from .operations import (
     dashboard_stats,
     variant_frequencies,
     recent_patients,
+    truncate_all_data,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "dashboard_stats",
     "variant_frequencies",
     "recent_patients",
+    "truncate_all_data",
 ]
