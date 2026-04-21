@@ -22,7 +22,9 @@ from dpyd_caller.patient_files import (
     save_patient_file,
 )
 from dpyd_caller.references import find_reference, references_status
+from dpyd_caller.validation import verify_file_matches_variant
 from dpyd_caller.variant_caller import analyze_variant
+from dpyd_caller.aligner import align_read, COMPLEMENT
 from db import (
     delete_patient,
     get_cpic_report,
@@ -63,10 +65,82 @@ def parse_fsa_cached(path_str: str, mtime: float) -> SangerRead:
     return parse_fsa(path_str)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def cached_verify(content: bytes, variant_id: str, direction: str, variants_json: str) -> dict:
+    variants_dict = json.loads(variants_json)
+    result = verify_file_matches_variant(content, variants_dict[variant_id], direction)
+    return {
+        "ok": result.ok,
+        "level": result.level,
+        "message": result.message,
+        "sample_name": result.sample_name,
+        "abif_sample_name": result.abif_sample_name,
+        "score": result.score,
+        "detected_orientation": result.detected_orientation,
+    }
+
+
+def _render_verification(uploaded_file, vid: str, direction: str, variants_json: str):
+    if uploaded_file is None:
+        return None
+    content = uploaded_file.getvalue()
+    result = cached_verify(content, vid, direction, variants_json)
+    if result["level"] == "ok":
+        st.success(f"✅ {result['message']}")
+    elif result["level"] == "warn":
+        st.warning(f"⚠️ {result['message']}")
+    else:
+        st.error(f"❌ {result['message']}")
+    return result
+
+
 def read_from_disk(path: Path | None) -> SangerRead | None:
     if path is None or not path.exists():
         return None
     return parse_fsa_cached(str(path), path.stat().st_mtime)
+
+
+@st.cache_data(show_spinner=False)
+def align_sequence_cached(read_sequence: str, amplicon_sense: str, is_reverse: bool):
+    return align_read(read_sequence, amplicon_sense, is_reverse)
+
+
+def compute_reference_track(
+    read: SangerRead,
+    amplicon_sense: str,
+    is_reverse: bool,
+    variant_offset: int,
+    window_start: int,
+    window_end: int,
+):
+    """For each basecall whose trace peak falls in [window_start, window_end], determine
+    the expected reference base (on the sequenced strand). Returns list of dicts."""
+    try:
+        alignment = align_sequence_cached(read.sequence, amplicon_sense, is_reverse)
+    except Exception:
+        return []
+    original_len = len(read.sequence)
+    bases = []
+    for (t_start, t_end), (q_start, q_end) in alignment.aligned_blocks:
+        for offset in range(t_end - t_start):
+            amp_pos = t_start + offset
+            q_pos = q_start + offset
+            orig_read_idx = original_len - 1 - q_pos if is_reverse else q_pos
+            if not (0 <= orig_read_idx < len(read.peak_locations)):
+                continue
+            trace_pos = read.peak_locations[orig_read_idx]
+            if not (window_start <= trace_pos <= window_end):
+                continue
+            amp_base = amplicon_sense[amp_pos].upper()
+            display_base = COMPLEMENT.get(amp_base, "N") if is_reverse else amp_base
+            bases.append({
+                "trace_pos": trace_pos,
+                "amp_pos": amp_pos,
+                "amp_base_coding": amp_base,
+                "display_base": display_base,
+                "is_variant": amp_pos == variant_offset,
+            })
+    return bases
 
 
 def plot_variant_region(
@@ -74,6 +148,9 @@ def plot_variant_region(
     peak_location: int,
     ref_channel: str,
     alt_channel: str,
+    amplicon_sense: str | None = None,
+    variant_offset: int | None = None,
+    is_reverse: bool = False,
     window_bases: int = 10,
     title: str = "",
 ):
@@ -81,26 +158,62 @@ def plot_variant_region(
     max_len = len(next(iter(read.traces.values())))
     start = max(0, peak_location - half_win)
     end = min(max_len, peak_location + half_win)
-    fig, ax = plt.subplots(figsize=(10, 2.8))
+
+    ref_track = []
+    if amplicon_sense and variant_offset is not None:
+        ref_track = compute_reference_track(
+            read, amplicon_sense, is_reverse, variant_offset, start, end
+        )
+
+    has_ref = len(ref_track) > 0
+    if has_ref:
+        fig, (ax_ref, ax_trace) = plt.subplots(
+            2, 1, figsize=(10, 3.6), sharex=True,
+            gridspec_kw={"height_ratios": [0.7, 3]},
+        )
+        for b in ref_track:
+            color = CHANNEL_COLORS.get(b["display_base"], "#666666")
+            is_var = b["is_variant"]
+            ax_ref.text(
+                b["trace_pos"], 0.5, b["display_base"],
+                color=color, ha="center", va="center",
+                fontweight="bold" if is_var else "normal",
+                fontsize=13 if is_var else 10,
+                bbox=dict(
+                    boxstyle="round,pad=0.2",
+                    fc="#fef9e7" if is_var else "white",
+                    ec="#8e44ad" if is_var else "#d0d0d0",
+                    lw=1.5 if is_var else 0.5,
+                ),
+            )
+        ax_ref.set_yticks([])
+        ax_ref.set_ylabel("Ref", fontsize=9, rotation=0, ha="right", va="center")
+        ax_ref.set_ylim(0, 1)
+        ax_ref.set_xlim(start, end)
+        ax_ref.set_frame_on(False)
+        ax_ref.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+    else:
+        fig, ax_trace = plt.subplots(figsize=(10, 2.8))
+
     x = list(range(start, end))
     for base, color in CHANNEL_COLORS.items():
         if base in read.traces:
             is_focus = base in (ref_channel, alt_channel)
-            ax.plot(
-                x,
-                read.traces[base][start:end],
+            ax_trace.plot(
+                x, read.traces[base][start:end],
                 color=color,
                 label=f"{base}{' ◀' if is_focus else ''}",
                 linewidth=2.0 if is_focus else 1.0,
                 alpha=1.0 if is_focus else 0.45,
             )
-    ax.axvspan(peak_location - 3, peak_location + 3, color="#f1c40f", alpha=0.25, label="_nolegend_")
-    ax.axvline(peak_location, color="#8e44ad", linestyle="--", alpha=0.9, linewidth=1.5)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("Posición en traza")
-    ax.set_ylabel("Intensidad")
-    ax.legend(loc="upper right", fontsize=8, ncols=4)
-    ax.grid(alpha=0.2)
+    ax_trace.axvspan(peak_location - 3, peak_location + 3, color="#f1c40f", alpha=0.25, label="_nolegend_")
+    ax_trace.axvline(peak_location, color="#8e44ad", linestyle="--", alpha=0.9, linewidth=1.5)
+    if title:
+        ax_trace.set_title(title, fontsize=10)
+    ax_trace.set_xlabel("Posición en traza")
+    ax_trace.set_ylabel("Intensidad")
+    ax_trace.legend(loc="upper right", fontsize=8, ncols=4)
+    ax_trace.grid(alpha=0.2)
     fig.tight_layout()
     return fig
 
@@ -240,6 +353,16 @@ def render_electropherogram_viewer(patient_id: str, variants: dict, calls: dict[
             if not d:
                 st.warning("No hay detalle guardado para esta lectura.")
                 continue
+
+            file_meta_bits = [f"📄 Archivo: `{path.name}`"]
+            if read.abif_sample_name:
+                file_meta_bits.append(f"Sample name: `{read.abif_sample_name}`")
+            if read.sample_name and read.sample_name != read.abif_sample_name:
+                file_meta_bits.append(f"ID interno: `{read.sample_name}`")
+            if read.run_name:
+                file_meta_bits.append(f"Run: `{read.run_name}`")
+            st.caption(" · ".join(file_meta_bits))
+
             peak_location = d["peak_location"]
             per_read_call = d.get("call", "")
             cols = st.columns(4)
@@ -247,11 +370,16 @@ def render_electropherogram_viewer(patient_id: str, variants: dict, calls: dict[
             cols[1].metric(f"Pico ref ({d.get('ref_channel')})", d.get("ref_height"))
             cols[2].metric(f"Pico alt ({d.get('alt_channel')})", d.get("alt_height"))
             cols[3].metric("Alt fraction", f"{d.get('alt_frac', 0):.2f}")
+
+            is_reverse_read = read_key.endswith("_rev")
             fig = plot_variant_region(
                 read,
                 peak_location=peak_location,
                 ref_channel=d.get("ref_channel") or ref_channel,
                 alt_channel=d.get("alt_channel") or alt_channel,
+                amplicon_sense=v.get("amplicon_sense"),
+                variant_offset=v.get("variant_offset_in_amplicon"),
+                is_reverse=is_reverse_read,
                 window_bases=window,
                 title=f"{label} — pico en {peak_location}  (call: {per_read_call})",
             )
@@ -267,19 +395,30 @@ def render_analysis_uploader(patient_id: str, variants: dict, mode_label: str):
         st.error(f"Faltan referencias para: {', '.join(missing_refs)}. Completar en `data/references/`.")
         return
 
-    st.caption("Subí fwd + rev de las 4 variantes. Las referencias se toman de `data/references/`.")
+    st.caption("Subí fwd + rev de las 4 variantes. Cada archivo se verifica contra el amplicón correspondiente.")
+    variants_json = json.dumps(variants)
     uploads = {}
+    verifications = {}
     for vid, v in variants.items():
         with st.expander(f"{v['name']} — `{v['hgvs_coding']}`", expanded=False):
             c1, c2 = st.columns(2)
             uploads[(vid, "fwd")] = c1.file_uploader(f"Forward — {v['name']}", key=f"reanal_{vid}_fwd", type=["fsa", "ab1"])
             uploads[(vid, "rev")] = c2.file_uploader(f"Reverse — {v['name']}", key=f"reanal_{vid}_rev", type=["fsa", "ab1"])
+            with c1:
+                verifications[(vid, "fwd")] = _render_verification(uploads[(vid, "fwd")], vid, "fwd", variants_json)
+            with c2:
+                verifications[(vid, "rev")] = _render_verification(uploads[(vid, "rev")], vid, "rev", variants_json)
 
     all_uploaded = all(u is not None for u in uploads.values())
     missing_count = sum(1 for u in uploads.values() if u is None)
     st.caption(f"{8 - missing_count}/8 archivos subidos")
 
-    if not st.button("Correr análisis", type="primary", disabled=not all_uploaded, key="run_analysis_btn"):
+    verification_errors = [v for v in verifications.values() if v and v["level"] == "error"]
+    if verification_errors:
+        st.error(f"⚠️ {len(verification_errors)} archivo(s) no corresponde(n) al amplicón asignado.")
+
+    blocked = not all_uploaded or len(verification_errors) > 0
+    if not st.button("Correr análisis", type="primary", disabled=blocked, key="run_analysis_btn"):
         return
 
     variant_calls_for_cpic = {}

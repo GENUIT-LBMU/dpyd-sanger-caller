@@ -17,6 +17,7 @@ from dpyd_caller.cpic import (
 from dpyd_caller.parser import parse_fsa
 from dpyd_caller.patient_files import save_patient_file
 from dpyd_caller.references import references_status
+from dpyd_caller.validation import verify_file_matches_variant
 from dpyd_caller.variant_caller import analyze_variant
 from db import (
     get_patient,
@@ -85,16 +86,50 @@ def validate(data: dict) -> list[str]:
     return errors
 
 
-def analysis_uploader(variants: dict):
+@st.cache_data(show_spinner=False, max_entries=32)
+def cached_verify(content: bytes, variant_id: str, direction: str, variants_json: str) -> dict:
+    variants = json.loads(variants_json)
+    result = verify_file_matches_variant(content, variants[variant_id], direction)
+    return {
+        "ok": result.ok,
+        "level": result.level,
+        "message": result.message,
+        "sample_name": result.sample_name,
+        "abif_sample_name": result.abif_sample_name,
+        "score": result.score,
+        "detected_orientation": result.detected_orientation,
+    }
+
+
+def _render_verification(uploaded_file, vid: str, direction: str, variants_json: str):
+    if uploaded_file is None:
+        return None
+    content = uploaded_file.getvalue()
+    result = cached_verify(content, vid, direction, variants_json)
+    if result["level"] == "ok":
+        st.success(f"✅ {result['message']}")
+    elif result["level"] == "warn":
+        st.warning(f"⚠️ {result['message']}")
+    else:
+        st.error(f"❌ {result['message']}")
+    return result
+
+
+def analysis_uploader(variants: dict, variants_json: str):
     st.subheader("Archivos del paciente (8 en total)")
-    st.caption("Subí fwd + rev para cada una de las 4 variantes. Las referencias se toman de `data/references/`.")
+    st.caption("Subí fwd + rev para cada una de las 4 variantes. Cada archivo se verifica automáticamente contra el amplicón correspondiente.")
     uploads = {}
+    verifications = {}
     for vid, v in variants.items():
         with st.expander(f"{v['name']} — `{v['hgvs_coding']}`", expanded=False):
             c1, c2 = st.columns(2)
             uploads[(vid, "fwd")] = c1.file_uploader(f"Forward — {v['name']}", key=f"{vid}_fwd", type=["fsa", "ab1"])
             uploads[(vid, "rev")] = c2.file_uploader(f"Reverse — {v['name']}", key=f"{vid}_rev", type=["fsa", "ab1"])
-    return uploads
+            with c1:
+                verifications[(vid, "fwd")] = _render_verification(uploads[(vid, "fwd")], vid, "fwd", variants_json)
+            with c2:
+                verifications[(vid, "rev")] = _render_verification(uploads[(vid, "rev")], vid, "rev", variants_json)
+    return uploads, verifications
 
 
 def run_panel_analysis(patient_id: str, variants: dict, uploads: dict, ref_status: dict):
@@ -163,6 +198,7 @@ def main():
     analyze_now = st.checkbox("Analizar secuencias ahora (si ya tenés los 8 archivos del paciente)")
 
     uploads = {}
+    verifications = {}
     ref_status = references_status(list(variants.keys()))
     missing_refs = [vid for vid, p in ref_status.items() if not (p["fwd"] and p["rev"])]
 
@@ -174,13 +210,21 @@ def main():
             )
             analyze_now = False
         else:
-            uploads = analysis_uploader(variants)
+            variants_json = json.dumps(variants)
+            uploads, verifications = analysis_uploader(variants, variants_json)
 
     all_uploaded = analyze_now and all(u is not None for u in uploads.values()) if uploads else False
+    verification_errors = [v for v in verifications.values() if v and v["level"] == "error"]
+    block_analysis = analyze_now and len(verification_errors) > 0
+    if block_analysis:
+        st.error(
+            f"⚠️ {len(verification_errors)} archivo(s) no corresponde(n) al amplicón asignado. "
+            f"Revisá las asignaciones antes de analizar."
+        )
 
     st.divider()
     submit_label = "Registrar + analizar" if (analyze_now and all_uploaded) else "Registrar como pendiente"
-    submitted = st.button(submit_label, type="primary")
+    submitted = st.button(submit_label, type="primary", disabled=block_analysis)
 
     if not submitted:
         if analyze_now and not all_uploaded:

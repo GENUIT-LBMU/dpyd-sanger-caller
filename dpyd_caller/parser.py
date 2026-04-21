@@ -15,6 +15,8 @@ class SangerRead:
     peak_locations: list[int]
     quality: list[int]
     base_order: str
+    abif_sample_name: str = ""
+    run_name: str = ""
 
 
 def _decode(value) -> str:
@@ -35,6 +37,9 @@ def parse_fsa(path: Union[str, Path]) -> SangerRead:
     peak_locations = list(raw.get("PLOC2") or raw.get("PLOC1") or [])
     quality = record.letter_annotations.get("phred_quality", [])
 
+    abif_sample_name = _decode(raw.get("SMPL1", "")).strip()
+    run_name = _decode(raw.get("RunN", raw.get("TUBE1", ""))).strip()
+
     return SangerRead(
         sample_name=record.name,
         sequence=str(record.seq),
@@ -42,4 +47,6 @@ def parse_fsa(path: Union[str, Path]) -> SangerRead:
         peak_locations=peak_locations,
         quality=list(quality),
         base_order=base_order,
+        abif_sample_name=abif_sample_name,
+        run_name=run_name,
     )
