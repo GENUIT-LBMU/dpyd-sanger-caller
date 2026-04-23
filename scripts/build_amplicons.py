@@ -24,7 +24,7 @@ AMPLICONS_DIR = PROJECT / "data" / "amplicons"
 
 CONTEXT_ANCHORS = {
     "DPYD_2A":       {"anchor_5": "CAGACAAC",  "anchor_3": "TAAGT"},
-    "DPYD_13":       {"anchor_5": "CACTCCTA",  "anchor_3": "TGATC"},
+    "DPYD_13":       {"anchor_5": "CATCAATGA", "anchor_3": "TCGAAG"},
     "DPYD_c2846AT":  {"anchor_5": "ATGATTG",   "anchor_3": "TGAAG"},
     "DPYD_HapB3":    {"anchor_5": "GGACAGA",   "anchor_3": "CAAGA"},
 }
