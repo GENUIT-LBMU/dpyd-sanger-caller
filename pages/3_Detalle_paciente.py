@@ -343,13 +343,24 @@ def render_electropherogram_viewer(patient_id: str, variants: dict, calls: dict[
     ref_fwd_path = find_reference(variant_id, "fwd")
     ref_rev_path = find_reference(variant_id, "rev")
 
-    if not sample_fwd_path or not sample_rev_path:
+    if not sample_fwd_path and not sample_rev_path:
         st.warning(
-            "⚠️ Los archivos `.fsa` del paciente no están en disco. "
-            "Esto puede pasar con pacientes analizados antes de esta versión. "
-            "Usá **Re-analizar** más abajo para recuperar los electroferogramas."
+            "⚠️ No hay archivos `.fsa` del paciente en disco para esta variante. "
+            "(Pacientes analizados antes de esta versión no tienen las trazas guardadas.) "
+            "Usá **Re-analizar** para recuperarlas."
         )
         return
+
+    mode_bits = []
+    if sample_fwd_path:
+        mode_bits.append("forward")
+    if sample_rev_path:
+        mode_bits.append("reverse")
+    if len(mode_bits) == 1:
+        st.info(
+            f"ℹ️ Sólo **{mode_bits[0]}** disponible para esta variante. "
+            f"Sin confirmación bidireccional — el llamado se basa en esta única lectura."
+        )
 
     window = st.slider(
         "Ventana alrededor del pico (bases)", min_value=5, max_value=40, value=12, step=1,
