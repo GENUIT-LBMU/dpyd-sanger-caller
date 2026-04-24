@@ -254,9 +254,6 @@ def main():
     submitted = st.button(submit_label, type="primary")
 
     if not submitted:
-        if analyze_now and not all_uploaded:
-            missing_count = sum(1 for u in uploads.values() if u is None)
-            st.caption(f"{8 - missing_count}/8 archivos subidos")
         return
 
     errors = validate(data)
