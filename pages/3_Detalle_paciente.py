@@ -42,6 +42,7 @@ VARIANTS_PATH = Path(__file__).parent.parent / "data" / "variants.json"
 CALL_EMOJI = {
     "hom_ref": "🟢", "het": "🟡", "hom_alt": "🔴",
     "unclear": "⚪", "discordant": "⚠️", "failed": "❌",
+    "missing": "⏸️",
 }
 CALL_LABELS = {
     "hom_ref": "Homo wild-type",
@@ -50,6 +51,7 @@ CALL_LABELS = {
     "unclear": "Ambigua",
     "discordant": "Discordante fwd/rev",
     "failed": "Falló",
+    "missing": "No testeada",
 }
 CHANNEL_COLORS = {"A": "#2ca02c", "C": "#1f77b4", "G": "#111111", "T": "#d62728"}
 
@@ -234,21 +236,33 @@ def render_demographics(patient: dict):
         st.markdown(f"**Notas**  \n{patient['notes']}")
 
 
-def render_cpic_card(cpic: dict | None):
+def render_cpic_card(cpic: dict | None, variants: dict, calls: dict[str, dict]):
     st.subheader("Reporte CPIC")
     if not cpic:
         st.info("Aún no se generó reporte CPIC para este paciente.")
         return
-    c1, c2, c3 = st.columns(3)
+
+    tested_ok = sum(1 for vid in variants if vid in calls and calls[vid]["genotype"] not in ("missing", "failed"))
+    untested = [variants[vid]["name"] for vid in variants
+                if vid not in calls or calls[vid]["genotype"] == "missing"]
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Activity Score", cpic["activity_score"] if cpic["activity_score"] is not None else "—")
     c2.metric("Fenotipo", cpic["phenotype"] or "—")
     c3.metric("Alelos (AV)", f"{cpic['allele1_av']} + {cpic['allele2_av']}" if cpic["allele1_av"] is not None else "—")
+    c4.metric("Variantes testeadas", f"{tested_ok}/{len(variants)}")
+
+    if untested:
+        st.info(
+            f"ℹ️ Interpretación **incompleta**: {len(untested)} variante(s) no testeada(s) — "
+            f"{', '.join(untested)}. Asumidas wild-type para el cálculo; un Poor Metabolizer podría no detectarse."
+        )
     if cpic["dosing_recommendation"]:
         st.success(f"**{cpic['dosing_label'] or ''}**")
         st.markdown(f"💊 **Recomendación**: {cpic['dosing_recommendation']}")
         st.caption(f"Fuerza de evidencia CPIC: {cpic.get('dosing_strength') or '—'}")
     if not cpic.get("reliable"):
-        st.warning("⚠️ Reporte no confiable — hay genotipos ambiguos/discordantes/fallidos.")
+        st.warning("⚠️ Reporte no confiable — hay genotipos ambiguos/discordantes/fallidos entre los testeados.")
     for note in cpic.get("notes", []):
         st.caption(f"⚠️ {note}")
     st.caption(f"Reportado: {cpic.get('reported_at', '—')}")
@@ -256,9 +270,6 @@ def render_cpic_card(cpic: dict | None):
 
 def render_variant_calls_table(variants: dict, calls: dict[str, dict]):
     st.subheader("Variantes analizadas")
-    if not calls:
-        st.info("Aún no hay análisis de variantes para este paciente.")
-        return
     rows = []
     for vid, v in variants.items():
         call = calls.get(vid)
@@ -266,19 +277,32 @@ def render_variant_calls_table(variants: dict, calls: dict[str, dict]):
             rows.append({
                 "Variante": v["name"],
                 "HGVS": v["hgvs_coding"],
-                "Genotipo": "—",
+                "Genotipo": f"{CALL_EMOJI['missing']} {CALL_LABELS['missing']}",
+                "Modo": "—",
                 "QC ref": "—",
                 "Concord.": "—",
                 "Analizado": "—",
             })
             continue
         g = call["genotype"]
+        details = call.get("details", {})
+        mode = "bidirectional"
+        # Heuristic: infer mode from which reads have details
+        has_fwd = details.get("sample_fwd") is not None
+        has_rev = details.get("sample_rev") is not None
+        if has_fwd and has_rev:
+            mode = "bi"
+        elif has_fwd:
+            mode = "fwd only"
+        elif has_rev:
+            mode = "rev only"
         rows.append({
             "Variante": v["name"],
             "HGVS": v["hgvs_coding"],
             "Genotipo": f"{CALL_EMOJI.get(g,'')} {CALL_LABELS.get(g, g)}",
+            "Modo": mode,
             "QC ref": "✅" if call["ref_qc_pass"] else "❌",
-            "Concord.": "✅" if call["sample_concordant"] else "⚠️",
+            "Concord.": "✅" if call["sample_concordant"] else ("—" if mode != "bi" else "⚠️"),
             "Analizado": call.get("analyzed_at", "—"),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -409,15 +433,33 @@ def render_analysis_uploader(patient_id: str, variants: dict, mode_label: str):
             with c2:
                 verifications[(vid, "rev")] = _render_verification(uploads[(vid, "rev")], vid, "rev", variants_json)
 
-    all_uploaded = all(u is not None for u in uploads.values())
-    missing_count = sum(1 for u in uploads.values() if u is None)
-    st.caption(f"{8 - missing_count}/8 archivos subidos")
+    files_uploaded = sum(1 for u in uploads.values() if u is not None)
+    variants_with_data = sorted({vid for (vid, _d), u in uploads.items() if u is not None})
+
+    status_bits = []
+    for vid in variants:
+        fwd_present = uploads.get((vid, "fwd")) is not None
+        rev_present = uploads.get((vid, "rev")) is not None
+        if fwd_present and rev_present:
+            status_bits.append(f"✅ {variants[vid]['name']}")
+        elif fwd_present or rev_present:
+            which = "fwd" if fwd_present else "rev"
+            status_bits.append(f"🟡 {variants[vid]['name']} ({which} only)")
+        else:
+            status_bits.append(f"⚪ {variants[vid]['name']}")
+    st.caption(
+        f"**{files_uploaded}/8 archivos** · {len(variants_with_data)}/{len(variants)} variantes con datos · "
+        + " · ".join(status_bits)
+    )
 
     verification_errors = [v for v in verifications.values() if v and v["level"] == "error"]
     if verification_errors:
-        st.error(f"⚠️ {len(verification_errors)} archivo(s) no corresponde(n) al amplicón asignado.")
+        st.warning(
+            f"⚠️ {len(verification_errors)} archivo(s) con verificación fallida. "
+            f"Podés igual correr — se reportarán `failed` si no se puede callear."
+        )
 
-    blocked = not all_uploaded or len(verification_errors) > 0
+    blocked = files_uploaded == 0
     if not st.button("Correr análisis", type="primary", disabled=blocked, key="run_analysis_btn"):
         return
 
@@ -425,26 +467,35 @@ def render_analysis_uploader(patient_id: str, variants: dict, mode_label: str):
     progress = st.progress(0.0, text="Iniciando...")
     for i, (vid, v) in enumerate(variants.items()):
         progress.progress((i + 0.1) / len(variants), text=f"Analizando {v['name']}...")
-        fwd_upload = uploads[(vid, "fwd")]
-        rev_upload = uploads[(vid, "rev")]
-        try:
-            sample_fwd_path = save_patient_file(
-                patient_id, vid, "fwd", fwd_upload.read(), original_name=fwd_upload.name,
-            )
-            sample_rev_path = save_patient_file(
-                patient_id, vid, "rev", rev_upload.read(), original_name=rev_upload.name,
-            )
-            reads = {
-                "ref_fwd": parse_fsa(ref_status[vid]["fwd"]),
-                "ref_rev": parse_fsa(ref_status[vid]["rev"]),
-                "sample_fwd": parse_fsa(sample_fwd_path),
-                "sample_rev": parse_fsa(sample_rev_path),
+        fwd_upload = uploads.get((vid, "fwd"))
+        rev_upload = uploads.get((vid, "rev"))
+
+        if fwd_upload is None and rev_upload is None:
+            variant_calls_for_cpic[vid] = {
+                "genotype": "missing",
+                "activity_value": v["activity_value"],
             }
-            analysis = analyze_variant(
-                vid, v,
-                reads["ref_fwd"], reads["ref_rev"],
-                reads["sample_fwd"], reads["sample_rev"],
-            )
+            progress.progress((i + 1) / len(variants), text=f"{v['name']} sin archivos")
+            continue
+
+        try:
+            sample_fwd_path = None
+            sample_rev_path = None
+            if fwd_upload is not None:
+                sample_fwd_path = save_patient_file(
+                    patient_id, vid, "fwd", fwd_upload.read(), original_name=fwd_upload.name,
+                )
+            if rev_upload is not None:
+                sample_rev_path = save_patient_file(
+                    patient_id, vid, "rev", rev_upload.read(), original_name=rev_upload.name,
+                )
+            reads = {
+                "ref_fwd": parse_fsa(ref_status[vid]["fwd"]) if ref_status[vid]["fwd"] else None,
+                "ref_rev": parse_fsa(ref_status[vid]["rev"]) if ref_status[vid]["rev"] else None,
+                "sample_fwd": parse_fsa(sample_fwd_path) if sample_fwd_path else None,
+                "sample_rev": parse_fsa(sample_rev_path) if sample_rev_path else None,
+            }
+            analysis = analyze_variant(vid, v, **reads)
             save_variant_call(patient_id, vid, analysis)
             variant_calls_for_cpic[vid] = {
                 "genotype": analysis.sample_genotype,
@@ -458,7 +509,17 @@ def render_analysis_uploader(patient_id: str, variants: dict, mode_label: str):
             }
         progress.progress((i + 1) / len(variants), text=f"{v['name']} listo")
 
-    cpic_result = calculate_activity_score(variant_calls_for_cpic)
+    # Incluir las variantes ya guardadas en DB que no están en esta corrida (preservar histórico)
+    from db import get_variant_calls
+    existing_calls = get_variant_calls(patient_id)
+    for vid, v in variants.items():
+        if vid not in variant_calls_for_cpic and vid in existing_calls:
+            variant_calls_for_cpic[vid] = {
+                "genotype": existing_calls[vid]["genotype"],
+                "activity_value": v["activity_value"],
+            }
+
+    cpic_result = calculate_activity_score(variant_calls_for_cpic, all_variant_ids=list(variants.keys()))
     phenotype = phenotype_from_activity_score(cpic_result["score"]) if cpic_result["reliable"] else None
     dosing = dosing_for(cpic_result["score"], phenotype["code"] if phenotype else None) if phenotype else None
     save_cpic_report(patient_id, cpic_result, phenotype or {}, dosing or {})
@@ -526,7 +587,7 @@ def main():
 
     render_demographics(patient)
     st.divider()
-    render_cpic_card(cpic)
+    render_cpic_card(cpic, variants, calls)
     st.divider()
     render_variant_calls_table(variants, calls)
     st.divider()

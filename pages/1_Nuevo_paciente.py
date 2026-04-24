@@ -138,26 +138,35 @@ def run_panel_analysis(patient_id: str, variants: dict, uploads: dict, ref_statu
     progress = st.progress(0.0, text="Iniciando...")
     for i, (vid, v) in enumerate(variants.items()):
         progress.progress((i + 0.1) / len(variants), text=f"Analizando {v['name']}...")
-        fwd_upload = uploads[(vid, "fwd")]
-        rev_upload = uploads[(vid, "rev")]
-        try:
-            sample_fwd_path = save_patient_file(
-                patient_id, vid, "fwd", fwd_upload.read(), original_name=fwd_upload.name,
-            )
-            sample_rev_path = save_patient_file(
-                patient_id, vid, "rev", rev_upload.read(), original_name=rev_upload.name,
-            )
-            reads = {
-                "ref_fwd": parse_fsa(ref_status[vid]["fwd"]),
-                "ref_rev": parse_fsa(ref_status[vid]["rev"]),
-                "sample_fwd": parse_fsa(sample_fwd_path),
-                "sample_rev": parse_fsa(sample_rev_path),
+        fwd_upload = uploads.get((vid, "fwd"))
+        rev_upload = uploads.get((vid, "rev"))
+
+        if fwd_upload is None and rev_upload is None:
+            variant_calls_for_cpic[vid] = {
+                "genotype": "missing",
+                "activity_value": v["activity_value"],
             }
-            analysis = analyze_variant(
-                vid, v,
-                reads["ref_fwd"], reads["ref_rev"],
-                reads["sample_fwd"], reads["sample_rev"],
-            )
+            progress.progress((i + 1) / len(variants), text=f"{v['name']} sin archivos — saltado")
+            continue
+
+        try:
+            sample_fwd_path = None
+            sample_rev_path = None
+            if fwd_upload is not None:
+                sample_fwd_path = save_patient_file(
+                    patient_id, vid, "fwd", fwd_upload.read(), original_name=fwd_upload.name,
+                )
+            if rev_upload is not None:
+                sample_rev_path = save_patient_file(
+                    patient_id, vid, "rev", rev_upload.read(), original_name=rev_upload.name,
+                )
+            reads = {
+                "ref_fwd": parse_fsa(ref_status[vid]["fwd"]) if ref_status[vid]["fwd"] else None,
+                "ref_rev": parse_fsa(ref_status[vid]["rev"]) if ref_status[vid]["rev"] else None,
+                "sample_fwd": parse_fsa(sample_fwd_path) if sample_fwd_path else None,
+                "sample_rev": parse_fsa(sample_rev_path) if sample_rev_path else None,
+            }
+            analysis = analyze_variant(vid, v, **reads)
             save_variant_call(patient_id, vid, analysis)
             variant_calls_for_cpic[vid] = {
                 "genotype": analysis.sample_genotype,
@@ -172,7 +181,7 @@ def run_panel_analysis(patient_id: str, variants: dict, uploads: dict, ref_statu
         progress.progress((i + 1) / len(variants), text=f"{v['name']} listo")
     progress.progress(1.0, text="Calculando CPIC...")
 
-    cpic_result = calculate_activity_score(variant_calls_for_cpic)
+    cpic_result = calculate_activity_score(variant_calls_for_cpic, all_variant_ids=list(variants.keys()))
     phenotype = phenotype_from_activity_score(cpic_result["score"]) if cpic_result["reliable"] else None
     dosing = dosing_for(cpic_result["score"], phenotype["code"] if phenotype else None) if phenotype else None
     save_cpic_report(patient_id, cpic_result, phenotype or {}, dosing or {})
@@ -213,18 +222,36 @@ def main():
             variants_json = json.dumps(variants)
             uploads, verifications = analysis_uploader(variants, variants_json)
 
-    all_uploaded = analyze_now and all(u is not None for u in uploads.values()) if uploads else False
+    files_uploaded = sum(1 for u in uploads.values() if u is not None)
+    any_uploaded = analyze_now and files_uploaded > 0
+    variants_with_data = sorted({vid for (vid, direction), u in uploads.items() if u is not None})
     verification_errors = [v for v in verifications.values() if v and v["level"] == "error"]
-    block_analysis = analyze_now and len(verification_errors) > 0
-    if block_analysis:
-        st.error(
-            f"⚠️ {len(verification_errors)} archivo(s) no corresponde(n) al amplicón asignado. "
-            f"Revisá las asignaciones antes de analizar."
+
+    if analyze_now:
+        status_bits = []
+        for vid in variants:
+            fwd_present = uploads.get((vid, "fwd")) is not None
+            rev_present = uploads.get((vid, "rev")) is not None
+            if fwd_present and rev_present:
+                status_bits.append(f"✅ {variants[vid]['name']}")
+            elif fwd_present or rev_present:
+                which = "fwd" if fwd_present else "rev"
+                status_bits.append(f"🟡 {variants[vid]['name']} ({which} only)")
+            else:
+                status_bits.append(f"⚪ {variants[vid]['name']} (sin archivos)")
+        st.caption(
+            f"**{files_uploaded}/8 archivos subidos** · {len(variants_with_data)}/{len(variants)} variantes con datos. "
+            + " · ".join(status_bits)
         )
+        if verification_errors:
+            st.warning(
+                f"⚠️ {len(verification_errors)} archivo(s) con verificación fallida. "
+                f"Podés igual correr el análisis — se reportarán como `failed` si no se puede llamar genotipo."
+            )
 
     st.divider()
-    submit_label = "Registrar + analizar" if (analyze_now and all_uploaded) else "Registrar como pendiente"
-    submitted = st.button(submit_label, type="primary", disabled=block_analysis)
+    submit_label = "Registrar + analizar" if (analyze_now and any_uploaded) else "Registrar como pendiente"
+    submitted = st.button(submit_label, type="primary")
 
     if not submitted:
         if analyze_now and not all_uploaded:
@@ -245,11 +272,12 @@ def main():
     upsert_patient(data)
     st.success(f"✅ Paciente `{data['patient_id']}` registrado.")
 
-    if analyze_now and all_uploaded:
+    if analyze_now and any_uploaded:
         with st.spinner("Analizando panel DPYD..."):
             run_panel_analysis(data["patient_id"], variants, uploads, ref_status)
         st.session_state["_flash_detail"] = (
-            f"✅ Paciente `{data['patient_id']}` registrado y análisis completado."
+            f"✅ Paciente `{data['patient_id']}` registrado y análisis completado "
+            f"({len(variants_with_data)}/{len(variants)} variantes con datos)."
         )
     else:
         st.session_state["_flash_detail"] = (

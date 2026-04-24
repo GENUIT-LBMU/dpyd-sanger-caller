@@ -48,6 +48,7 @@ class VariantAnalysis:
     reference_qc_pass: bool
     sample_concordant: bool
     sample_genotype: str
+    analysis_mode: str = "bidirectional"   # bidirectional | fwd_only | rev_only | missing
     errors: list[str] = field(default_factory=list)
 
 
@@ -124,11 +125,17 @@ def _call_single_read(
 def analyze_variant(
     variant_id: str,
     variant: dict,
-    ref_fwd: SangerRead,
-    ref_rev: SangerRead,
-    sample_fwd: SangerRead,
-    sample_rev: SangerRead,
+    ref_fwd: Optional[SangerRead] = None,
+    ref_rev: Optional[SangerRead] = None,
+    sample_fwd: Optional[SangerRead] = None,
+    sample_rev: Optional[SangerRead] = None,
 ) -> VariantAnalysis:
+    """Analyze a variant with any combination of reads present.
+
+    All four reads are optional. If both sample_fwd and sample_rev are None,
+    the variant is reported as "missing". Single-direction analysis is supported
+    (analysis_mode will be fwd_only or rev_only).
+    """
     amplicon_sense = variant["amplicon_sense"]
     variant_pos = variant["variant_offset_in_amplicon"]
     ref_base = variant["ref_allele_sense"].upper()
@@ -146,6 +153,8 @@ def analyze_variant(
         ("sample_rev", sample_rev, True),
     ]
     for key, read, is_rev in inputs:
+        if read is None:
+            continue
         try:
             calls[key] = _call_single_read(
                 read, is_rev, amplicon_sense, variant_pos, ref_base, alt_base, key,
@@ -153,33 +162,60 @@ def analyze_variant(
         except Exception as exc:
             errors.append(f"{key}: {exc}")
 
-    ref_qc = (
-        calls["ref_fwd"] is not None and calls["ref_rev"] is not None
-        and calls["ref_fwd"].call == "hom_ref" and calls["ref_rev"].call == "hom_ref"
-    )
+    # Reference QC: pass if every available reference read shows hom_ref.
+    ref_calls_present = [c for c in (calls["ref_fwd"], calls["ref_rev"]) if c is not None]
+    if ref_calls_present:
+        ref_qc = all(c.call == "hom_ref" for c in ref_calls_present)
+    else:
+        ref_qc = False
 
-    sample_concordant = (
-        calls["sample_fwd"] is not None and calls["sample_rev"] is not None
-        and calls["sample_fwd"].call == calls["sample_rev"].call
-        and calls["sample_fwd"].call != "unclear"
-    )
+    sample_fwd_call = calls["sample_fwd"]
+    sample_rev_call = calls["sample_rev"]
 
-    if calls["sample_fwd"] and calls["sample_rev"]:
-        if sample_concordant:
-            genotype = calls["sample_fwd"].call
+    if sample_fwd_call is None and sample_rev_call is None:
+        analysis_mode = "missing"
+        genotype = "missing"
+        sample_concordant = False
+    elif sample_fwd_call is not None and sample_rev_call is not None:
+        analysis_mode = "bidirectional"
+        fc, rc = sample_fwd_call.call, sample_rev_call.call
+        if fc == rc and fc != "unclear":
+            genotype = fc
+            sample_concordant = True
+        elif fc == "unclear" and rc == "unclear":
+            genotype = "unclear"
+            sample_concordant = False
+        elif fc == "unclear":
+            genotype = rc
+            sample_concordant = False
+            errors.append("fwd ambigua — llamado basado sólo en rev")
+        elif rc == "unclear":
+            genotype = fc
+            sample_concordant = False
+            errors.append("rev ambigua — llamado basado sólo en fwd")
         else:
             genotype = "discordant"
+            sample_concordant = False
+    elif sample_fwd_call is not None:
+        analysis_mode = "fwd_only"
+        genotype = sample_fwd_call.call
+        sample_concordant = False
+        errors.append("Sólo forward disponible — sin confirmación bidireccional")
     else:
-        genotype = "failed"
+        analysis_mode = "rev_only"
+        genotype = sample_rev_call.call
+        sample_concordant = False
+        errors.append("Sólo reverse disponible — sin confirmación bidireccional")
 
     return VariantAnalysis(
         variant_id=variant_id,
         ref_fwd=calls["ref_fwd"],
         ref_rev=calls["ref_rev"],
-        sample_fwd=calls["sample_fwd"],
-        sample_rev=calls["sample_rev"],
+        sample_fwd=sample_fwd_call,
+        sample_rev=sample_rev_call,
         reference_qc_pass=ref_qc,
         sample_concordant=sample_concordant,
         sample_genotype=genotype,
+        analysis_mode=analysis_mode,
         errors=errors,
     )

@@ -20,10 +20,12 @@ VARIANTS_PATH = Path(__file__).parent.parent / "data" / "variants.json"
 CALL_EMOJI = {
     "hom_ref": "🟢", "het": "🟡", "hom_alt": "🔴",
     "unclear": "⚪", "discordant": "⚠️", "failed": "❌",
+    "missing": "⏸️",
 }
 CALL_LABELS = {
     "hom_ref": "WT/WT", "het": "WT/var", "hom_alt": "var/var",
     "unclear": "ambig", "discordant": "disc", "failed": "fail",
+    "missing": "no test",
 }
 
 
